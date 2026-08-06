@@ -967,16 +967,23 @@ with tab_drift:
 # 5/25 band rule. Nothing here mutates core model state.
 # ----------------------------------------------------------------------
 
-def compute_effective_exposure(targets: dict) -> pd.DataFrame:
+def compute_effective_exposure(targets: dict, min_implicit: float = 0.25) -> pd.DataFrame:
     """FEATURE 1 — Look-through exposure.
     Effective weight of a single name = its explicit satellite %
     + sum over broad ETFs of (ETF target % × that stock's weight inside it).
-    Uses OVERLAP_ESTIMATES (editable, approximate)."""
+    Uses OVERLAP_ESTIMATES (editable, approximate).
+
+    A name is listed when it is actually held explicitly, or when its implicit
+    weight alone reaches `min_implicit`. Without that floor the table lists every
+    name that appears anywhere inside a broad index fund — including ones the user
+    has switched off, which reads as a bug. Residual sub-threshold exposure is
+    still reported, via residual_lookthrough() below.
+    """
     rows = []
     for stock, holders in OVERLAP_ESTIMATES.items():
         implicit = sum(targets.get(h, 0.0) * frac / 100.0 for h, frac in holders.items())
         explicit = targets.get(stock, 0.0)
-        if implicit > 0.005 or explicit > 0:
+        if explicit > 0 or implicit >= min_implicit:
             rows.append({
                 "Stock": stock,
                 "Implicit % (inside ETFs)": round(implicit, 2),
@@ -985,6 +992,26 @@ def compute_effective_exposure(targets: dict) -> pd.DataFrame:
             })
     df = pd.DataFrame(rows)
     return df.sort_values("Effective total %", ascending=False) if not df.empty else df
+
+
+def residual_lookthrough(targets: dict, cls: str, min_implicit: float = 0.25) -> dict:
+    """Names of a given asset class that the portfolio holds ONLY indirectly, via
+    broad index funds, below the display threshold.
+
+    This matters for Bank-Compliant Mode: excluding crypto satellites does not
+    reach zero crypto exposure, because broad market funds hold names like MSTR.
+    Reported so the residual is disclosed rather than silently dropped.
+    """
+    out = {}
+    for stock, holders in OVERLAP_ESTIMATES.items():
+        if ASSET_META.get(stock, {}).get("cls") != cls:
+            continue
+        if targets.get(stock, 0.0) > 0:
+            continue  # held explicitly — it appears in the main table instead
+        implicit = sum(targets.get(h, 0.0) * frac / 100.0 for h, frac in holders.items())
+        if 0 < implicit < min_implicit:
+            out[stock] = implicit
+    return out
 
 
 def compute_diversification(targets: dict, port_vol: float) -> dict:
@@ -1590,6 +1617,25 @@ with sub_exp:
         "If VTI+QQQ already give you 8% NVDA, a 5% satellite is a 13% concentrated bet — size the satellite off the "
         "*effective* number, not the sticker number. Overlap %s are rough estimates — edit OVERLAP_ESTIMATES with current index weights."
     )
+
+    # Residual crypto held only inside broad index funds — policy-relevant in bank mode.
+    _resid = residual_lookthrough(targets, "crypto")
+    if _resid and bank_mode:
+        _tot = sum(_resid.values())
+        st.info(
+            "🏦 **Bank-Compliant Mode note — residual indirect exposure.** Excluding crypto satellites removes "
+            "every *direct* position, but broad index funds still hold some crypto-linked equities: "
+            + ", ".join(f"**{k}** {v:.2f}%" for k, v in sorted(_resid.items(), key=lambda x: -x[1]))
+            + f" (total ≈ **{_tot:.2f}%** of the portfolio, held via VTI/QQQ, not purchased directly). "
+            "These are below the table's display threshold and are not positions you control. Flagging them because "
+            "a strict no-crypto policy cannot reach exactly zero while holding total-market index funds — worth "
+            "confirming how your institution treats indirect index exposure."
+        )
+    elif _resid:
+        st.caption(
+            "Held only indirectly, inside broad index funds (below display threshold): "
+            + ", ".join(f"{k} {v:.2f}%" for k, v in sorted(_resid.items(), key=lambda x: -x[1]))
+        )
 
 
 with sub_div:
