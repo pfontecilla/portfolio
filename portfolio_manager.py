@@ -83,6 +83,11 @@ ASSET_META = {
     "QQQ":   dict(name="Invesco Nasdaq-100",                cls="tech",   r=8.0,  v=19.0, er=0.20),
 }
 
+# Snapshot of each built-in asset's MODERATE baseline volatility, captured before
+# any assumption set can modify it. apply_return_assumptions() always scales from
+# this snapshot, which keeps volatility adjustments idempotent across reruns.
+BASELINE_VOLS = {_t: _m["v"] for _t, _m in ASSET_META.items()}
+
 # Approximate long-run correlation matrix between asset CLASSES
 CORR = {
     "eq":     {"eq": 1.00, "fac": 0.88, "reit": 0.70, "gold": 0.05, "bond": 0.10, "tips": 0.05, "crypto": 0.35, "tech": 0.85},
@@ -143,17 +148,90 @@ NEW_LISTING_WARNING = {
 # ----------------------------------------------------------------------
 # 1c. PRODUCTION — RETURN ASSUMPTION SETS + OPERATING MODES
 # ----------------------------------------------------------------------
-# Three capital-market assumption sets, by asset CLASS (% nominal / yr).
-# - Conservative ≈ forward-looking institutional CMAs (Vanguard/BlackRock-style)
-# - Base         ≈ blend of forward CMAs and history (the app's original values)
-# - Optimistic   ≈ long-run US historical averages (S&P ~10% since 1926; small-cap
-#                  value ~12% per Fama-French data). Historical averages are NOT
-#                  forecasts — using this set assumes the future repeats the past.
-# Volatility and correlation assumptions are deliberately NOT changed across sets.
+# Four capital-market assumption sets, by asset CLASS.
+#
+# ==== THESE ARE ARITHMETIC MEANS, NOT CAGRs ====
+# compute_metrics() treats these as the arithmetic mean and derives the geometric
+# CAGR by subtracting variance drag, so a documented historical GEOMETRIC figure
+# must never be typed in directly (that would subtract the drag twice).
+#
+# ==== RETURNS AND VOLATILITY ARE PAIRED PER SET ====
+# The two historical sets use the documented historical ARITHMETIC mean together
+# with the documented historical VOLATILITY (see VOL_SCALARS below). Because both
+# halves of the pair come from the same historical record, the geometric CAGR the
+# model derives lands on the historical geometric figure on its own:
+#
+#   class  set          arith    vol      -> derived geo    historical geo
+#   eq     Optimistic   12.0%    19.8%       10.29%         ~10.2%  (S&P 500 1926-2024)
+#   fac    Optimistic   16.2%    30.0%       12.51%         ~12.5%  (small-cap value)
+#   reit   Optimistic   11.0%    19.6%        9.31%          ~9.3%  (NAREIT 1972-)
+#   bond   Optimistic    5.5%     5.5%        5.35%          ~5.4%  (US IG long-run)
+#   eq     Hist.Upper   12.4%    19.8%       10.66%         upper end
+#   fac    Hist.Upper   17.0%    31.0%       13.10%         ~13.1%  (FF small value)
+#
+# Earlier versions of this file kept low (forward-looking) volatilities in the
+# historical sets, which understated risk AND inflated the derived CAGR by roughly
+# half a point. Pairing each set's returns with its own volatility fixes both.
+#
+# Sources for the historical figures:
+# - eq: SBBI / Ibbotson large-cap US 1926-2024 — arithmetic ~11.9-12.5%,
+#   volatility ~19.8%, geometric ~10.0-10.5% nominal (NYU Stern dataset ~10.2%).
+# - fac: SBBI small-cap 1926-2024 — arithmetic 16.2% at 31.6% volatility, implying
+#   ~12.1% geometric. Fama-French / Dimensional small-VALUE series run modestly
+#   higher; AVUV-style profitability screening trims volatility slightly, hence
+#   30-31% rather than 31.6%.
+# - International equity has historically trailed the US over the same period, so
+#   holding it in the same "eq" class is mildly generous to ex-US markets.
+# - crypto: NO long history exists. Speculative placeholder only, and excluded
+#   entirely in Bank-Compliant Mode.
 RETURN_ASSUMPTIONS = {
-    "Conservative": {"eq": 6.0,  "fac": 7.0,  "reit": 5.0, "gold": 3.0, "bond": 4.0, "tips": 3.5, "crypto": 8.0,  "tech": 6.5},
-    "Base":         {"eq": 7.5,  "fac": 8.5,  "reit": 6.5, "gold": 4.0, "bond": 4.3, "tips": 3.8, "crypto": 12.0, "tech": 8.5},
-    "Optimistic":   {"eq": 10.0, "fac": 12.0, "reit": 8.5, "gold": 5.0, "bond": 4.8, "tips": 4.0, "crypto": 18.0, "tech": 11.0},
+    # Current institutional forward-looking CMAs (Vanguard, BlackRock et al.,
+    # 2025-26): US equity 10-yr expected returns mostly 4.0-6.5% on elevated
+    # valuations. The set a professional would defend for a projection today.
+    "Conservative": {"eq": 6.0,  "fac": 7.0,  "reit": 5.0,  "gold": 3.0, "bond": 4.0, "tips": 3.5, "crypto": 8.0,  "tech": 6.5},
+    # Balanced view: blends forward CMAs with long-run history.
+    "Base":         {"eq": 7.5,  "fac": 8.5,  "reit": 6.5,  "gold": 4.0, "bond": 4.3, "tips": 3.8, "crypto": 12.0, "tech": 8.5},
+    # Documented long-run historical ARITHMETIC means (paired with historical vol).
+    "Optimistic":   {"eq": 12.0, "fac": 16.2, "reit": 11.0, "gold": 6.0, "bond": 5.5, "tips": 4.2, "crypto": 27.0, "tech": 13.0},
+    # Upper end of documented historical experience. PAST != FUTURE.
+    "Historical Upper Bound": {"eq": 12.4, "fac": 17.0, "reit": 11.4, "gold": 6.4, "bond": 5.7, "tips": 4.4, "crypto": 30.0, "tech": 14.0},
+}
+
+# Per-set VOLATILITY multipliers applied to each asset's baseline volatility in
+# ASSET_META, by asset class. Conservative and Base deliberately have NO
+# adjustment: they keep the model's moderate, forward-looking volatilities.
+# The two historical sets scale volatility up to long-run realized levels so that
+# risk and return come from the same historical record.
+#
+#   class  baseline -> Optimistic / Hist.Upper       justification
+#   eq      15.5%   ->  19.8%  (x1.277)             SBBI large-cap realized vol
+#   fac     20.0%   ->  30.0% / 31.0% (x1.50/1.55)  SBBI small-cap 31.6%, trimmed
+#                                                    slightly for profitability screen
+#   reit    17.0%   ->  19.6%  (x1.153)             NAREIT realized vol
+#   gold    15.0%   ->  18.8%  (x1.253)             gold post-1971 realized vol
+#   tech    19.0%   ->  21.0%  (x1.105)             modest; class vols already high
+#   bond/tips       ->  ~unchanged                  historical vol close to baseline
+VOL_SCALARS = {
+    "Conservative": {},   # baseline volatilities — no adjustment
+    "Base": {},           # baseline volatilities — no adjustment
+    "Optimistic":              {"eq": 1.277, "fac": 1.50, "reit": 1.153, "gold": 1.253, "tips": 1.10, "tech": 1.105},
+    "Historical Upper Bound":  {"eq": 1.277, "fac": 1.55, "reit": 1.153, "gold": 1.253, "tips": 1.10, "tech": 1.105},
+}
+
+# Shown in the UI wherever an assumption set is selected.
+ASSUMPTION_NOTES = {
+    "Conservative": "Current institutional forward-looking CMAs (Vanguard/BlackRock-style, 2025-26), with the "
+                    "model's moderate baseline volatilities. The most defensible set for a projection today.",
+    "Base": "Balanced view — blends forward-looking CMAs with long-run history, at baseline volatilities.",
+    "Optimistic": "Long-run historical averages, **paired with long-run historical volatilities** "
+                  "(equities 19.8%, small-cap value 30%). Risk and return both come from the same historical "
+                  "record, so the derived CAGR lands on the historical figure (~10.2% equities, ~12.5% small value). "
+                  "Assumes the future resembles the past — an assumption, not a forecast.",
+    "Historical Upper Bound": "⚠️ Upper end of documented long-run historical experience, weighted toward the "
+                              "small-cap value premium, **at historical volatilities (up to 31%)**. "
+                              "**Based on past performance — NOT a forecast.** Note the deeper drawdown estimate: "
+                              "this is what earning those returns historically felt like. Use to bound the "
+                              "optimistic case, never as a planning baseline.",
 }
 
 MODES = ("Corporate Treasury", "Personal Retirement")
@@ -340,9 +418,22 @@ with st.sidebar:
         bank_mode = st.toggle("🏦 Bank-Compliant Mode (no crypto)", key="w_bank",
                               help="Excludes IBIT, BSOL, MSTR and any crypto-class custom tickers, per bank policy.")
         assume = st.selectbox("Return assumptions", list(RETURN_ASSUMPTIONS), key="w_assume",
-                              help="Conservative ≈ forward-looking institutional CMAs · Base ≈ blend · "
-                                   "Optimistic ≈ long-run US historical averages (equities ~10%, small-cap value ~12%). "
-                                   "Historical averages are not forecasts.")
+                              help="Conservative = current institutional forward CMAs · Base = balanced blend · "
+                                   "Optimistic = long-run historical averages · Historical Upper Bound = upper end "
+                                   "of past experience (past ≠ future). Values are ARITHMETIC means; the app derives "
+                                   "the compounded CAGR from them. The two historical sets also raise VOLATILITY to "
+                                   "historical levels (small-cap value 30-31%), so risk and return stay paired.")
+        if assume == "Historical Upper Bound":
+            st.warning(ASSUMPTION_NOTES[assume])
+        else:
+            st.caption(ASSUMPTION_NOTES[assume])
+        if VOL_SCALARS.get(assume):
+            st.caption(f"📊 Volatility: **historical levels** — equities "
+                       f"{BASELINE_VOLS['VTI'] * VOL_SCALARS[assume]['eq']:.1f}%, small-cap value "
+                       f"{BASELINE_VOLS['AVUV'] * VOL_SCALARS[assume]['fac']:.1f}%.")
+        else:
+            st.caption(f"📊 Volatility: **baseline (moderate)** — equities {BASELINE_VOLS['VTI']:.1f}%, "
+                       f"small-cap value {BASELINE_VOLS['AVUV']:.1f}%.")
         risk_idx = st.select_slider(
             "Risk level", options=list(range(len(RISK_LEVELS))), key="w_risk", format_func=lambda i: RISK_LEVELS[i]
         )
@@ -527,14 +618,26 @@ def compute_satellites(sat_raw, risk_idx, per_cap, bank=False):
 
 
 def apply_return_assumptions(assume_name: str) -> None:
-    """Overwrite each built-in asset's expected return with its class-level
-    value from the selected assumption set. Runs every rerun (the module —
-    and therefore ASSET_META — is rebuilt top-to-bottom each time, so this
-    never goes stale). Custom tickers keep the user's own return input.
-    Volatilities and correlations are identical across sets by design."""
+    """Apply the selected assumption set's expected returns AND volatilities.
+
+    Returns come from RETURN_ASSUMPTIONS[set][class]; volatilities are the
+    asset's BASELINE_VOLS value scaled by VOL_SCALARS[set][class] (default 1.0,
+    i.e. Conservative and Base keep the model's moderate baseline volatilities).
+
+    Scaling always starts from BASELINE_VOLS rather than the current value, so
+    calling this repeatedly in one session never compounds the adjustment.
+
+    Custom (user-added) tickers keep the return and volatility the user entered —
+    the app has no historical basis on which to override their inputs.
+    """
+    rets = RETURN_ASSUMPTIONS[assume_name]
+    vols = VOL_SCALARS.get(assume_name, {})
     for _t, _meta in ASSET_META.items():
-        if _t not in st.session_state.custom_meta:
-            _meta["r"] = RETURN_ASSUMPTIONS[assume_name][_meta["cls"]]
+        if _t in st.session_state.custom_meta:
+            continue
+        _cls = _meta["cls"]
+        _meta["r"] = rets[_cls]
+        _meta["v"] = BASELINE_VOLS[_t] * vols.get(_cls, 1.0)
 
 
 apply_return_assumptions(assume)
@@ -1094,6 +1197,8 @@ def build_ips_text(targets: dict, risk_label: str, basis: float, years: int,
         "",
         f"Operating mode:      {mode_name}" + ("  ·  BANK-COMPLIANT (no crypto)" if bank else ""),
         f"Return assumptions:  {assume_name}",
+        f"  basis:             {'long-run historical averages (past != future)' if 'Optimistic' in assume_name or 'Historical' in assume_name else 'forward-looking capital market assumptions'}",
+        f"  volatility basis:  {'historical realized levels (equities ~19.8%, small-cap value ~30%)' if VOL_SCALARS.get(assume_name) else 'baseline moderate (equities 15.5%, small-cap value 20%)'}",
         f"Risk mandate:        {risk_label}",
         f"Portfolio basis:     ${basis:,.0f}",
         f"{mt['horizon_line']:<21}{years} years",
@@ -1331,15 +1436,39 @@ def run_backtest(close: pd.DataFrame, weights: dict, min_months: int = 24) -> di
 
 with tab_outlook:
     st.subheader("Risk & return estimates")
+    st.caption(f"**Assumption set: {assume}.** {ASSUMPTION_NOTES[assume]}")
+
+    # --- Both return figures, side by side and explained ---
+    r1, r2, r3 = st.columns([1, 1, 1.4])
+    r1.metric("Arithmetic expected return", f"{metrics['ret']:.2f}%",
+              help="Weighted average of each holding's expected return. This is the standard "
+                   "mean-variance input — but no portfolio actually compounds at this rate.")
+    r2.metric("Geometric CAGR (compounded)", f"{metrics['cagr']:.2f}%",
+              delta=f"-{metrics['drag']:.2f}pp variance drag", delta_color="inverse",
+              help="What wealth actually compounds at, after variance drag. Terminal value follows THIS number.")
+    r3.info(
+        f"**Why they differ:** volatility itself destroys compounded return. At {metrics['vol']:.1f}% "
+        f"volatility the gap is **{metrics['drag']:.2f} percentage points per year**. A portfolio that "
+        f"gains 50% then loses 33% has an arithmetic mean of +8.5% but ends exactly flat. "
+        f"**Use {metrics['cagr']:.2f}% for any projection of terminal wealth.**"
+    )
+    if VOL_SCALARS.get(assume):
+        st.caption(
+            f"ℹ️ **{assume}** pairs historical returns with **historical volatilities** "
+            f"(equities {BASELINE_VOLS['VTI'] * VOL_SCALARS[assume]['eq']:.1f}%, small-cap value "
+            f"{BASELINE_VOLS['AVUV'] * VOL_SCALARS[assume]['fac']:.1f}%), so the drag above is larger — and the "
+            f"drawdown estimate deeper — than under Conservative/Base. That is deliberate: earning historical "
+            f"returns meant living through historical volatility."
+        )
+
+    st.divider()
     m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("Est. CAGR (compounded)", f"{metrics['cagr']:.1f}%",
-              help=f"Geometric return — what wealth actually compounds at. "
-                   f"Arithmetic mean is {metrics['ret']:.1f}%; volatility drag costs {metrics['drag']:.1f}pp.")
+    m1.metric("Growth exposure", f"{metrics['growth']:.0f}%")
     m2.metric("Est. volatility", f"{metrics['vol']:.1f}%")
     m3.metric("Sharpe (rf≈3.5%)", f"{metrics['sharpe']:.2f}")
     m4.metric("Est. max drawdown", f"{metrics['dd']:.0f}%")
     m5.metric("Blended ER", f"{metrics['er']:.2f}%")
-    m6.metric("Growth exposure", f"{metrics['growth']:.0f}%")
+    m6.metric("Variance drag", f"{metrics['drag']:.2f}pp")
 
     st.divider()
     st.subheader(f"{years}-year projection")
