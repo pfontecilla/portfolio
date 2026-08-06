@@ -88,6 +88,29 @@ ASSET_META = {
 # this snapshot, which keeps volatility adjustments idempotent across reruns.
 BASELINE_VOLS = {_t: _m["v"] for _t, _m in ASSET_META.items()}
 
+# ----------------------------------------------------------------------
+# 1d. CUSTOM TICKER AUTO-FILL — sector/type mapping and fallbacks
+# ----------------------------------------------------------------------
+# yfinance sector strings -> this model's correlation classes.
+SECTOR_TO_CLASS = {
+    "technology": "tech",
+    "communication services": "tech",
+    "consumer cyclical": "eq",
+    "consumer defensive": "eq",
+    "financial services": "eq",
+    "healthcare": "eq",
+    "industrials": "eq",
+    "basic materials": "eq",
+    "energy": "eq",
+    "utilities": "eq",
+    "real estate": "reit",
+}
+# Fallback volatility (%) by class when history is too short to measure.
+FALLBACK_VOL_BY_CLASS = {
+    "tech": 40.0, "eq": 25.0, "fac": 28.0, "reit": 20.0,
+    "gold": 16.0, "bond": 6.0, "tips": 4.0, "crypto": 70.0,
+}
+
 # Approximate long-run correlation matrix between asset CLASSES
 CORR = {
     "eq":     {"eq": 1.00, "fac": 0.88, "reit": 0.70, "gold": 0.05, "bond": 0.10, "tips": 0.05, "crypto": 0.35, "tech": 0.85},
@@ -339,6 +362,9 @@ _WIDGET_DEFAULTS = {
     "w_ibit": False, "w_bsol": False, "w_percap": 5, "w_sats": [],
     "w_ibit_pct": 0.0, "w_bsol_pct": 0.0,
     "w_mode": "Corporate Treasury", "w_bank": True, "w_assume": "Base",
+    # Custom-ticker form: these are written by the auto-fill callback, so the
+    # widgets read them from session_state instead of passing value=.
+    "new_ticker": "", "new_cls": "tech", "new_r": 8.0, "new_v": 30.0, "new_er": 0.0,
 }
 for _k, _v in _WIDGET_DEFAULTS.items():
     st.session_state.setdefault(_k, _v)
@@ -408,6 +434,199 @@ if "_cfg_error" in st.session_state:
 # 3. SIDEBAR — MANDATE + SATELLITE CONTROLS
 # ----------------------------------------------------------------------
 
+# ----------------------------------------------------------------------
+# 2b. CUSTOM TICKER AUTO-FILL
+# ----------------------------------------------------------------------
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_ticker_profile(ticker: str) -> dict:
+    """Look up one ticker and SUGGEST model inputs for it.
+
+    Measures what can actually be measured and guesses the rest, reporting which
+    is which so the UI never presents a guess as data:
+      * v   — annualized volatility from real daily history (1y preferred, then
+              max available). Falls back to a class default if history is short.
+      * cls — inferred from yfinance quoteType/sector. Always user-editable.
+      * er  — real expense ratio for funds; 0.00 for individual stocks.
+      * r   — NOT fetched. Expected return is a class-level assumption applied by
+              the caller from the active RETURN_ASSUMPTIONS set, because no
+              defensible per-stock return forecast exists.
+
+    Never raises: returns {"ok": False, "error": ...} so the UI can degrade to
+    plain defaults. Cached one hour per ticker.
+    """
+    out = {"ok": False, "ticker": ticker, "cls": "eq", "v": None, "er": 0.00,
+           "name": ticker, "vol_basis": None, "quote_type": None, "error": None,
+           "price": None}
+
+    def _with_fallback_vol(d: dict) -> dict:
+        """Guarantee a usable numeric volatility on every return path.
+        Callers do float(prof["v"]), so leaving this None would raise."""
+        if d["v"] is None:
+            d["v"] = FALLBACK_VOL_BY_CLASS.get(d["cls"], 25.0)
+            d["vol_basis"] = d["vol_basis"] or "class default (no data available)"
+        return d
+
+    if yf is None:
+        out["error"] = "yfinance is not installed"
+        return _with_fallback_vol(out)
+    try:
+        tk = yf.Ticker(ticker)
+
+        # --- metadata (best effort; .info is the flakiest part of yfinance) ---
+        info = {}
+        try:
+            info = tk.info or {}
+        except Exception:
+            info = {}
+
+        qt = str(info.get("quoteType") or "").upper()
+        out["quote_type"] = qt or None
+        out["name"] = info.get("shortName") or info.get("longName") or ticker
+
+        # --- asset class inference ---
+        if qt == "CRYPTOCURRENCY":
+            out["cls"] = "crypto"
+        elif qt in ("ETF", "MUTUALFUND"):
+            cat = str(info.get("category") or "").lower()
+            if any(k in cat for k in ("bond", "treasury", "fixed income", "municipal")):
+                out["cls"] = "tips" if "inflation" in cat or "tips" in cat else "bond"
+            elif "real estate" in cat:
+                out["cls"] = "reit"
+            elif "small" in cat and "value" in cat:
+                out["cls"] = "fac"
+            elif any(k in cat for k in ("gold", "precious", "commodit")):
+                out["cls"] = "gold"
+            elif "technology" in cat:
+                out["cls"] = "tech"
+            else:
+                out["cls"] = "eq"
+        else:  # individual equity
+            sector = str(info.get("sector") or "").lower()
+            out["cls"] = SECTOR_TO_CLASS.get(sector, "eq")
+
+        # --- expense ratio: only funds have one ---
+        if qt in ("ETF", "MUTUALFUND"):
+            raw_er = info.get("netExpenseRatio")
+            if raw_er is None:
+                raw_er = info.get("annualReportExpenseRatio")
+            if raw_er is not None:
+                try:
+                    er = float(raw_er)
+                    # yfinance is inconsistent: sometimes a fraction (0.0003),
+                    # sometimes already a percent (0.03). Treat small values as
+                    # fractions and scale them up.
+                    out["er"] = round(er * 100.0, 3) if er < 0.5 else round(er, 3)
+                except (TypeError, ValueError):
+                    pass
+
+        # --- volatility from real daily history ---
+        hist = None
+        for period, label in (("1y", "1-year daily history"), ("max", "full available history")):
+            try:
+                h = tk.history(period=period, interval="1d", auto_adjust=True)
+            except Exception:
+                h = None
+            if h is not None and len(h) >= 60:
+                hist = h
+                out["vol_basis"] = label
+                break
+        if hist is not None:
+            rets = hist["Close"].pct_change().dropna()
+            if len(rets) >= 60:
+                ann = float(rets.std()) * np.sqrt(252.0) * 100.0
+                if np.isfinite(ann) and 0.5 < ann < 250:
+                    out["v"] = round(ann, 1)
+                    out["ok"] = True
+        if out["v"] is None:
+            out["v"] = FALLBACK_VOL_BY_CLASS.get(out["cls"], 25.0)
+            out["vol_basis"] = "class default (insufficient price history)"
+            # Metadata may still have worked, so treat it as a partial success.
+            out["ok"] = bool(out["quote_type"])
+
+        # --- last price, so the Add step doesn't need a second call ---
+        try:
+            fi = tk.fast_info
+            px = fi.get("lastPrice") or fi.get("last_price")
+            if px and float(px) > 0:
+                out["price"] = round(float(px), 2)
+        except Exception:
+            pass
+        if out["price"] is None and hist is not None and len(hist):
+            out["price"] = round(float(hist["Close"].iloc[-1]), 2)
+
+        if not out["ok"] and out["error"] is None:
+            out["error"] = "no usable data returned"
+        return out
+    except Exception as e:
+        out["error"] = str(e)[:160]
+        return _with_fallback_vol(out)
+
+
+def _autofill_custom_ticker() -> None:
+    """on_change callback for the custom-ticker input.
+
+    Runs BEFORE the script reruns, which is the only safe point at which the
+    number_input/selectbox session_state keys can be written — assigning them
+    after those widgets have rendered raises StreamlitAPIException.
+
+    Only fires when the symbol actually changed, so a user's manual tweaks to the
+    suggested numbers survive every unrelated rerun (moving a slider, switching
+    tabs). Typing a different symbol intentionally replaces the suggestions.
+    """
+    raw = str(st.session_state.get("new_ticker", "") or "")
+    tkr = raw.strip().upper()
+    st.session_state["new_ticker"] = tkr  # auto-uppercase the field
+
+    if not tkr or tkr == st.session_state.get("_autofill_for"):
+        return
+    st.session_state["_autofill_for"] = tkr
+    st.session_state["_autofill_blocked"] = False
+
+    if tkr in ASSET_META or tkr in st.session_state.custom_meta:
+        st.session_state["_autofill_msg"] = ("warning", f"{tkr} is already in the model.")
+        return
+
+    prof = fetch_ticker_profile(tkr)
+    assume_now = st.session_state.get("w_assume", "Base")
+    bank_now = bool(st.session_state.get("w_bank", True))
+    cls = prof["cls"]
+
+    # Bank-Compliant Mode: a crypto-class instrument cannot be added at all.
+    if bank_now and cls == "crypto":
+        st.session_state["_autofill_blocked"] = True
+        st.session_state["_autofill_msg"] = (
+            "error",
+            f"**{tkr}** looks like a crypto instrument ({prof.get('name')}). "
+            f"Bank-Compliant Mode excludes crypto, so it cannot be added. "
+            f"Turn the mode off in ① Mandate if this classification is wrong."
+        )
+        return
+
+    # Expected return is a CLASS assumption, never a per-stock forecast.
+    st.session_state["new_cls"] = cls
+    st.session_state["new_r"] = float(RETURN_ASSUMPTIONS[assume_now][cls])
+    st.session_state["new_v"] = float(prof["v"])
+    st.session_state["new_er"] = float(prof["er"])
+    if prof["price"]:
+        st.session_state[f"_autofill_px_{tkr}"] = prof["price"]
+
+    if prof["ok"]:
+        st.session_state["_autofill_msg"] = (
+            "success",
+            f"**{prof['name']}** ({prof.get('quote_type') or 'security'}) · class **{cls}** · "
+            f"volatility **{prof['v']:.1f}%** from {prof['vol_basis']} · expense ratio "
+            f"**{prof['er']:.2f}%** · expected return **{st.session_state['new_r']:.1f}%** from the "
+            f"*{assume_now}* assumption set for class `{cls}`. Review and click Add."
+        )
+    else:
+        st.session_state["_autofill_msg"] = (
+            "warning",
+            f"Couldn't fetch reliable data for **{tkr}** ({prof.get('error') or 'unknown issue'}). "
+            f"Filled clean defaults for class `{cls}` instead — please check every field before adding."
+        )
+
+
 with st.sidebar:
     # Pinned summary — filled in after compute_satellites() runs (see §3c).
     summary_slot = st.container()
@@ -476,27 +695,58 @@ with st.sidebar:
             st.caption("No satellites active — you're running the pure 8-fund core model from the plan.")
 
     with st.expander("③ Custom Tickers", expanded=False):
-        st.caption("Not in the built-in list? Add any ticker — it's treated as a satellite, subject to the same caps.")
-        new_t = st.text_input("Ticker symbol", value="", placeholder="e.g. AMZN").strip().upper()
+        st.caption("Not in the built-in list? Type a symbol and press Enter — the app looks it up and "
+                   "pre-fills the fields. It's treated as a satellite, subject to the same caps.")
+
+        new_t = st.text_input("Ticker symbol", placeholder="e.g. AMZN — press Enter to look up",
+                              key="new_ticker", on_change=_autofill_custom_ticker).strip().upper()
+
+        # Result of the lookup (set by the callback on the previous run).
+        _msg = st.session_state.get("_autofill_msg")
+        if _msg and new_t:
+            getattr(st, _msg[0])(_msg[1])
+
+        _cls_opts = [c for c in ["tech", "eq", "fac", "reit", "gold", "bond", "tips", "crypto"]
+                     if not (bank_mode and c == "crypto")]
+        # A suggested class must exist in the current option list, or the widget
+        # would raise. Bank mode can shrink the list after a lookup.
+        if st.session_state.get("new_cls") not in _cls_opts:
+            st.session_state["new_cls"] = _cls_opts[0]
+
         new_cls = st.selectbox(
             "Asset class (drives its risk/correlation assumptions)",
-            [c for c in ["tech", "eq", "fac", "reit", "gold", "bond", "tips", "crypto"]
-             if not (bank_mode and c == "crypto")],
-            index=0,
+            _cls_opts, key="new_cls",
+            help="Auto-suggested from the security's type/sector when a lookup succeeds. Always editable.",
         )
         cc1, cc2, cc3 = st.columns(3)
-        new_r = cc1.number_input("Est. return %", value=8.0, step=0.5, key="new_r")
-        new_v = cc2.number_input("Est. vol %", value=30.0, step=1.0, key="new_v")
-        new_er = cc3.number_input("Expense ratio %", value=0.0, step=0.01, key="new_er")
-        if st.button("Add ticker", width='stretch'):
+        new_r = cc1.number_input("Est. return %", step=0.5, key="new_r",
+                                 help="Class-level assumption from the active Return Assumptions set — "
+                                      "NOT a forecast for this specific security.")
+        new_v = cc2.number_input("Est. vol %", step=1.0, key="new_v",
+                                 help="Measured from real daily price history when available.")
+        new_er = cc3.number_input("Expense ratio %", step=0.01, key="new_er",
+                                  help="Fetched for funds; 0.00 for individual stocks.")
+
+        if new_t and st.session_state.get("_autofill_for") == new_t:
+            st.caption("These are **suggestions** — edit any field before adding. Note that a single stock's "
+                       "measured volatility is largely idiosyncratic risk, which markets do not reward with "
+                       "extra expected return; that is why the class return plus a high vol yields a low "
+                       "compounded CAGR here. That result is correct, not a glitch.")
+
+        _blocked = bool(st.session_state.get("_autofill_blocked"))
+        if st.button("Add ticker", width='stretch', disabled=_blocked):
             if not new_t:
                 st.warning("Enter a ticker symbol first.")
             elif new_t in ASSET_META or new_t in st.session_state.custom_meta:
                 st.warning(f"{new_t} is already in the model.")
+            elif bank_mode and new_cls == "crypto":
+                st.error("Crypto-class holdings can't be added in Bank-Compliant Mode.")
             else:
-                st.session_state.custom_meta[new_t] = dict(name=new_t, cls=new_cls, r=new_r, v=new_v, er=new_er)
-                px = None
-                if yf is not None:
+                st.session_state.custom_meta[new_t] = dict(
+                    name=new_t, cls=new_cls, r=new_r, v=new_v, er=new_er)
+                # Reuse the price captured during lookup; only call out again if absent.
+                px = st.session_state.pop(f"_autofill_px_{new_t}", None)
+                if px is None and yf is not None:
                     try:
                         fast = yf.Ticker(new_t).fast_info
                         px = fast.get("lastPrice") or fast.get("last_price")
@@ -504,6 +754,8 @@ with st.sidebar:
                         px = None
                 st.session_state.prices[new_t] = round(float(px), 2) if px else 100.0
                 st.session_state.shares.setdefault(new_t, 0.0)
+                for _k in ("_autofill_for", "_autofill_msg", "_autofill_blocked"):
+                    st.session_state.pop(_k, None)
                 st.success(f"Added {new_t} — set its target % below.")
                 st.rerun()
 
